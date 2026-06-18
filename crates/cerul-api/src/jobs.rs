@@ -889,6 +889,13 @@ fn is_job_cancelled(paths: &AppPaths, job_id: &str) -> anyhow::Result<bool> {
 
 fn mark_job_cancelled_after_processing(paths: &AppPaths, job: &ClaimedJob) -> anyhow::Result<()> {
     let conn = cerul_storage::sqlite::open(paths)?;
+    let item_status = conn
+        .query_row(
+            "SELECT status FROM items WHERE id = ?1",
+            [job.item_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
     conn.execute(
         r#"
         UPDATE jobs
@@ -902,16 +909,20 @@ fn mark_job_cancelled_after_processing(paths: &AppPaths, job: &ClaimedJob) -> an
         "#,
         [job.id.as_str()],
     )?;
-    conn.execute(
-        r#"
-        UPDATE items
-        SET status = 'discovered',
-            error = NULL,
-            indexed_at = NULL
-        WHERE id = ?1
-        "#,
-        [job.item_id.as_str()],
-    )?;
+    if item_status.as_deref() == Some("deleting") {
+        conn.execute("DELETE FROM items WHERE id = ?1", [job.item_id.as_str()])?;
+    } else {
+        conn.execute(
+            r#"
+            UPDATE items
+            SET status = 'discovered',
+                error = NULL,
+                indexed_at = NULL
+            WHERE id = ?1
+            "#,
+            [job.item_id.as_str()],
+        )?;
+    }
     Ok(())
 }
 
@@ -1393,6 +1404,43 @@ mod tests {
         );
         assert_job(&paths, "job-1", "cancelled", 1.0, None);
         assert_item_status(&paths, "item-1", "discovered", None);
+    }
+
+    #[test]
+    fn cancelled_deleting_item_is_removed_after_processor_returns() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_data_dir(temp.path()).unwrap();
+        insert_job(
+            &paths,
+            "job-1",
+            "item-1",
+            "index_video",
+            "cancelled",
+            "deleting",
+        );
+        let job = ClaimedJob {
+            id: "job-1".to_string(),
+            item_id: "item-1".to_string(),
+            job_type: "index_video".to_string(),
+        };
+
+        mark_job_cancelled_after_processing(&paths, &job).unwrap();
+
+        let conn = sqlite::open(&paths).unwrap();
+        let item_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM items WHERE id = 'item-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let job_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobs WHERE id = 'job-1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(item_count, 0);
+        assert_eq!(job_count, 0);
     }
 
     #[test]

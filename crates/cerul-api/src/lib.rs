@@ -1713,7 +1713,7 @@ async fn list_items(
                    LIMIT 1
                ) AS thumbnail_chunk_id
         FROM items i
-        WHERE 1 = 1
+        WHERE i.status != 'deleting'
         "#
     );
     if !statuses.is_empty() {
@@ -1977,13 +1977,28 @@ async fn remove_item(
         "#,
         [id.as_str()],
     )?;
-    let removed = tx.execute("DELETE FROM items WHERE id = ?1", [id.as_str()])?;
+    let removed = if has_running_jobs {
+        tx.execute(
+            r#"
+            UPDATE items
+            SET status = 'deleting',
+                error = NULL
+            WHERE id = ?1
+            "#,
+            [id.as_str()],
+        )?
+    } else {
+        tx.execute("DELETE FROM items WHERE id = ?1", [id.as_str()])?
+    };
     if removed != 1 {
         return Err(ApiError::not_found(format!("item not found: {id}")));
     }
     tx.commit()?;
 
-    Ok(Json(json!({ "status": "removed", "id": id })))
+    Ok(Json(json!({
+        "status": if has_running_jobs { "deleting" } else { "removed" },
+        "id": id
+    })))
 }
 
 fn item_has_running_jobs(paths: &AppPaths, item_id: &str) -> anyhow::Result<bool> {
@@ -2008,15 +2023,21 @@ fn remember_removed_item(
     let Some(external_id) = item.external_id.as_deref() else {
         return Ok(());
     };
+    let raw_path = item.raw_path.as_deref().or_else(|| {
+        item.metadata
+            .get("raw_path")
+            .and_then(serde_json::Value::as_str)
+    });
     tx.execute(
         r#"
-        INSERT INTO ignored_items (source_id, external_id, reason, ignored_at)
-        VALUES (?1, ?2, 'removed_from_library', strftime('%s','now'))
+        INSERT INTO ignored_items (source_id, external_id, raw_path, reason, ignored_at)
+        VALUES (?1, ?2, ?3, 'removed_from_library', strftime('%s','now'))
         ON CONFLICT(source_id, external_id) DO UPDATE SET
             ignored_at = excluded.ignored_at,
+            raw_path = COALESCE(excluded.raw_path, ignored_items.raw_path),
             reason = excluded.reason
         "#,
-        (item.source_id.as_str(), external_id),
+        (item.source_id.as_str(), external_id, raw_path),
     )?;
     Ok(())
 }
@@ -3252,14 +3273,45 @@ fn upsert_discovered_item(
     content_type: ContentType,
     item: &DiscoveredItem,
 ) -> anyhow::Result<Option<String>> {
-    if is_discovered_item_ignored(tx, source_id, &item.external_id)? {
+    if is_discovered_item_ignored(tx, source_id, item)? {
         return Ok(None);
     }
 
-    let item_id = new_id("item");
     let content_type = content_type_value(content_type);
     let raw_path = item.metadata.get("raw_path").and_then(Value::as_str);
     let metadata = item.metadata.to_string();
+    if let Some(existing_id) = existing_item_id_for_raw_path(tx, raw_path)? {
+        tx.execute(
+            r#"
+            UPDATE items
+            SET content_type = ?2,
+                external_id = ?3,
+                title = ?4,
+                duration_sec = ?5,
+                raw_path = ?6,
+                metadata = ?7,
+                error = NULL,
+                status = CASE
+                    WHEN status IN ('indexed', 'fetching', 'processing') THEN status
+                    ELSE 'discovered'
+                END
+            WHERE id = ?1
+              AND status != 'deleting'
+            "#,
+            (
+                existing_id.as_str(),
+                content_type,
+                item.external_id.as_str(),
+                item.title.as_deref(),
+                item.duration_sec,
+                raw_path,
+                metadata.as_str(),
+            ),
+        )?;
+        return Ok(Some(existing_id));
+    }
+
+    let item_id = new_id("item");
 
     tx.execute(
         r#"
@@ -3307,19 +3359,61 @@ fn upsert_discovered_item(
     )?))
 }
 
+fn existing_item_id_for_raw_path(
+    tx: &Transaction<'_>,
+    raw_path: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let Some(raw_path) = raw_path.map(str::trim).filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(tx
+        .query_row(
+            r#"
+            SELECT id
+            FROM items
+            WHERE raw_path = ?1
+              AND status != 'deleting'
+            ORDER BY
+                CASE status
+                    WHEN 'indexed' THEN 0
+                    WHEN 'processing' THEN 1
+                    WHEN 'fetching' THEN 2
+                    ELSE 3
+                END,
+                id ASC
+            LIMIT 1
+            "#,
+            [raw_path],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 fn is_discovered_item_ignored(
     tx: &Transaction<'_>,
     source_id: &str,
-    external_id: &str,
+    item: &DiscoveredItem,
 ) -> anyhow::Result<bool> {
+    let raw_path = item
+        .metadata
+        .get("raw_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
     let ignored: i64 = tx.query_row(
         r#"
         SELECT COUNT(*)
         FROM ignored_items
         WHERE source_id = ?1
-          AND external_id = ?2
+          AND (
+              external_id = ?2
+              OR (
+                  ?3 IS NOT NULL
+                  AND raw_path = ?3
+              )
+          )
         "#,
-        (source_id, external_id),
+        (source_id, item.external_id.as_str(), raw_path),
         |row| row.get(0),
     )?;
     Ok(ignored > 0)
@@ -4937,6 +5031,7 @@ mod tests {
     async fn item_delete_and_reindex_update_storage() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::from_data_dir(temp.path()).unwrap();
+        let raw_path = temp.path().join("clip.mp4").to_string_lossy().into_owned();
         {
             let conn = cerul_storage::sqlite::open(&paths).unwrap();
             conn.execute(
@@ -4947,11 +5042,11 @@ mod tests {
             conn.execute(
                 r#"
                 INSERT INTO items (
-                    id, source_id, content_type, external_id, title, indexed_at, status, metadata
+                    id, source_id, content_type, external_id, title, raw_path, indexed_at, status, metadata
                 )
-                VALUES ('item-1', 'source-1', 'video', 'clip.mp4', 'Clip', 10, 'indexed', '{}')
+                VALUES ('item-1', 'source-1', 'video', 'clip.mp4', 'Clip', ?1, 10, 'indexed', '{}')
                 "#,
-                [],
+                [raw_path.as_str()],
             )
             .unwrap();
             conn.execute(
@@ -5042,11 +5137,27 @@ mod tests {
                 external_id: "clip.mp4".to_string(),
                 title: Some("Clip".to_string()),
                 duration_sec: Some(10.0),
-                metadata: json!({ "raw_path": "/tmp/clip.mp4" }),
+                metadata: json!({ "raw_path": raw_path.as_str() }),
             },
         )
         .unwrap();
         assert_eq!(rediscovered, None);
+        let rediscovered_with_changed_external_id = upsert_discovered_item(
+            &tx,
+            "source-1",
+            ContentType::Video,
+            &DiscoveredItem {
+                external_id: "changed-metadata-id".to_string(),
+                title: Some("Clip".to_string()),
+                duration_sec: Some(10.0),
+                metadata: json!({ "raw_path": raw_path.as_str() }),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            rediscovered_with_changed_external_id, None,
+            "raw_path tombstone should block rediscovery even if external_id changes"
+        );
         tx.commit().unwrap();
 
         let conn = cerul_storage::sqlite::open(&paths).unwrap();
@@ -5054,6 +5165,207 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
             .unwrap();
         assert_eq!(items, 0, "ignored item should not be rediscovered");
+    }
+
+    #[tokio::test]
+    async fn list_items_hides_items_pending_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_data_dir(temp.path()).unwrap();
+        {
+            let conn = cerul_storage::sqlite::open(&paths).unwrap();
+            conn.execute(
+                "INSERT INTO sources (id, type, config, status) VALUES ('source-1', 'folder_video', '{}', 'active')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                INSERT INTO items (
+                    id, source_id, content_type, external_id, title, status, metadata
+                )
+                VALUES
+                    ('item-visible', 'source-1', 'video', 'visible.mp4', 'Visible', 'indexed', '{}'),
+                    ('item-deleting', 'source-1', 'video', 'deleting.mp4', 'Deleting', 'deleting', '{}')
+                "#,
+                [],
+            )
+            .unwrap();
+        }
+
+        let app = router_with_paths(paths);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let items = response_json(response).await;
+        let ids = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["item-visible"]);
+    }
+
+    #[tokio::test]
+    async fn deleting_running_item_hides_it_until_worker_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_data_dir(temp.path()).unwrap();
+        {
+            let conn = cerul_storage::sqlite::open(&paths).unwrap();
+            conn.execute(
+                "INSERT INTO sources (id, type, config, status) VALUES ('source-1', 'folder_video', '{}', 'active')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                INSERT INTO items (
+                    id, source_id, content_type, external_id, title, status, metadata
+                )
+                VALUES ('item-running', 'source-1', 'video', 'running.mp4', 'Running', 'processing', '{}')
+                "#,
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                INSERT INTO jobs (id, item_id, job_type, status, progress)
+                VALUES ('job-running', 'item-running', 'index_video', 'running', 0.5)
+                "#,
+                [],
+            )
+            .unwrap();
+        }
+
+        let app = router_with_paths(paths.clone());
+        let delete = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/items/item-running")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::OK);
+        let delete = response_json(delete).await;
+        assert_eq!(delete["status"], "deleting");
+
+        let conn = cerul_storage::sqlite::open(&paths).unwrap();
+        let item_status: String = conn
+            .query_row(
+                "SELECT status FROM items WHERE id = 'item-running'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let job_status: String = conn
+            .query_row(
+                "SELECT status FROM jobs WHERE id = 'job-running'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(item_status, "deleting");
+        assert_eq!(job_status, "cancelled");
+        drop(conn);
+
+        let items = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(items.status(), StatusCode::OK);
+        assert_eq!(response_json(items).await.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn rediscovering_same_raw_path_reuses_existing_item() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_data_dir(temp.path()).unwrap();
+        let raw_path = temp.path().join("clip.mp4").to_string_lossy().into_owned();
+        {
+            let conn = cerul_storage::sqlite::open(&paths).unwrap();
+            conn.execute(
+                "INSERT INTO sources (id, type, config, status) VALUES ('source-1', 'file_video', '{}', 'active'), ('source-2', 'file_video', '{}', 'active')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                INSERT INTO items (
+                    id, source_id, content_type, external_id, title, raw_path, status, error, metadata
+                )
+                VALUES (
+                    'item-existing',
+                    'source-1',
+                    'video',
+                    'old-external-id',
+                    'Old title',
+                    ?1,
+                    'failed',
+                    'previous failure',
+                    '{}'
+                )
+                "#,
+                [raw_path.as_str()],
+            )
+            .unwrap();
+        }
+
+        let mut conn = cerul_storage::sqlite::open(&paths).unwrap();
+        let tx = conn.transaction().unwrap();
+        let item_id = upsert_discovered_item(
+            &tx,
+            "source-2",
+            ContentType::Video,
+            &DiscoveredItem {
+                external_id: "new-external-id".to_string(),
+                title: Some("New title".to_string()),
+                duration_sec: Some(12.0),
+                metadata: json!({ "raw_path": raw_path.as_str(), "fresh": true }),
+            },
+        )
+        .unwrap();
+        assert_eq!(item_id.as_deref(), Some("item-existing"));
+        tx.commit().unwrap();
+
+        let conn = cerul_storage::sqlite::open(&paths).unwrap();
+        let item_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        let row: (String, String, Option<String>, String) = conn
+            .query_row(
+                r#"
+                SELECT external_id, title, error, status
+                FROM items
+                WHERE id = 'item-existing'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(item_count, 1);
+        assert_eq!(row.0, "new-external-id");
+        assert_eq!(row.1, "New title");
+        assert_eq!(row.2, None);
+        assert_eq!(row.3, "discovered");
     }
 
     #[tokio::test]
